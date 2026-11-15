@@ -1,0 +1,21 @@
+# Bloque para Hermes Agent (C:\Users\<USUARIO>\AppData\Local\hermes\config.yaml).
+# Se anade DENTRO de la clave mcp_servers existente (junto a qgis, bricscad, word,
+# vectorcraft, pdfcraft y blender), sin duplicarla. Lo hace 04_configurar_mcp_comfyui.bat.
+# Hermes no pasa todo el entorno de Windows al MCP: por eso el bloque env (el lanzador usa
+# rutas absolutas y fija COMFY_URL, IA_IMAGENES y COMFY_MCP_ESPERA por su cuenta).
+mcp_servers:
+  comfyui:
+    command: "C:\\Windows\\System32\\cmd.exe"
+    args: ["/d", "/c", "C:\\ComfyUI_MCP\\comfyui-mcp-launch.bat"]
+    env:
+      USERPROFILE: "C:\\Users\\<USUARIO>"
+      LOCALAPPDATA: "C:\\Users\\<USUARIO>\\AppData\\Local"
+      APPDATA: "C:\\Users\\<USUARIO>\\AppData\\Roaming"
+      SystemRoot: "C:\\Windows"
+      TEMP: "C:\\Users\\<USUARIO>\\AppData\\Local\\Temp"
+      TMP: "C:\\Users\\<USUARIO>\\AppData\\Local\\Temp"
+      USERNAME: "<USUARIO>"
+      HOMEDRIVE: "C:"
+      HOMEPATH: "\\Users\\<USUARIO>"
+      ProgramFiles: "C:\\Program Files"
+      ProgramW6432: "C:\\Program Files"

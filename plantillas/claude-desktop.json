@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "C:\\Windows\\System32\\cmd.exe",
+      "args": [
+        "/d",
+        "/c",
+        "C:\\ComfyUI_MCP\\comfyui-mcp-launch.bat"
+      ]
+    }
+  }
+}

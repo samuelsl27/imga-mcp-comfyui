@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-mcp-imga"
+version = "1.1.0"
+description = "Servidor MCP propio de IMGA para generar y editar imagenes con el ComfyUI local"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp==1.30.0",      # la 2.x renombra FastMCP -> MCPServer: no subir sin adaptar
+    "pillow==13.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

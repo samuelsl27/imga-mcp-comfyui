@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.tmp
+*.tmp_notas_ia
+# resultados e imagenes de prueba: no se versionan
+salida/
+*.png
+*.jpg
+*.webp
+!docs/**/*.png
