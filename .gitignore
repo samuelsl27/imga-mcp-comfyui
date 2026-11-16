@@ -10,3 +10,5 @@ salida/
 *.jpg
 *.webp
 !docs/**/*.png
+# mensaje del proximo commit (lo escribe el agente; lo usa scripts/01_commit_git.bat)
+scripts/mensaje_commit.txt

@@ -4,9 +4,17 @@ Servidor MCP (stdio) que deja a Claude Desktop (y a otras apps de IA) generar y 
 con el ComfyUI LOCAL del MS-S1 (http://127.0.0.1:8188), usando los flujos en formato API
 exportados de las plantillas oficiales (carpeta flujos\\):
 
+  generar_qwen21.json  Qwen-Image 2.1 (texto -> imagen, calidad; POR DEFECTO desde 1.2.0)
+  editar_qwen21.json   Qwen-Image 2.1 (edicion con 1-10 imagenes de referencia; POR DEFECTO desde 1.2.0)
   generar_rapido.json  Z-Image Turbo (texto -> imagen, rapido)
   generar_texto.json   Qwen-Image 2512 + LoRA Lightning 4 pasos (rotulos y texto legible)
-  editar.json          Qwen-Image-Edit 2511 + LoRA Lightning 4 pasos (1-3 imagenes de referencia)
+  editar.json          Qwen-Image-Edit 2511 + LoRA Lightning 4 pasos (1-3 imagenes de referencia, rapido)
+  video_wan.json       Wan 2.2 14B imagen -> video (LoRA lightx2v 4 pasos) + fotograma de muestra (desde 1.3.0)
+  video_acabado.json   RelayVSR x2 + 1920x1080 + FILM x2 (32 fps) + fotograma de muestra (desde 1.3.0)
+Licencias: Qwen-Image 2.1 = Qwen Research License (investigacion/evaluacion, NO comercial sin licencia de
+Qwen); los demas (Wan 2.2, RelayVSR, FILM incluidos), Apache-2.0. Cada imagen guarda en su .json el modelo y la licencia.
+Flujos editados desde ComfyUI (menu IMGA -> Guardar como flujo del MCP) en
+C:\\ComfyUI\\ComfyUI\\user\\default\\imga_flujos\\ tienen prioridad sobre los instalados, si son validos.
 
 Todo lo que genera aparece tambien en la cola/historial de ComfyUI (misma instancia) y se guarda en
 C:\\IA_Imagenes\\AAAA-MM-DD\\ con un .json al lado (prompt, semilla, flujo, entradas, tiempo).
@@ -19,6 +27,26 @@ Variables de entorno (opcionales):
   COMFY_MCP_AUTOARRANQUE  1 (por defecto) = si ComfyUI no responde, lo arranca solo; 0 = no
   COMFY_LANZADOR       lanzador del servidor de ComfyUI (por defecto C:\\ComfyUI\\comfyui-launch.bat)
   COMFY_MCP_ARRANQUE   segundos maximos esperando a que ComfyUI arranque (por defecto 40)
+  COMFY_MCP_MODELO     qwen21 (por defecto: modo "calidad" = Qwen-Image 2.1) o clasico (modo "calidad" =
+                       Qwen 2512 para generar y Qwen-Edit 2511 para editar, todo Apache-2.0)
+  COMFY_MCP_VISOR      1 (por defecto) = abre la interfaz de ComfyUI si no esta abierta, para ver lo que hace
+                       el MCP (el complemento IMGA abre cada trabajo como pestana); 0 = no
+  COMFY_FLUJOS_USUARIO carpeta de flujos editados (por defecto C:\\ComfyUI\\ComfyUI\\user\\default\\imga_flujos)
+  COMFY_MCP_REVISAR    1 (por defecto) = avisa si una imagen o el fotograma de un video sale gris/plano o ruido
+                       (GPU calculando mal, caso del 2026-11-16); 0 = no revisa
+
+Video (v1.3.0, spec 005): generar_video(prompt, imagen, calidad) devuelve enseguida un prompt_id.
+  calidad="borrador"   (por defecto) Wan 2.2 a 832x576, 16 fps, ~8-9 min por 5 s.
+  calidad="definitivo" Wan 2.2 a 1280x720 (~23 min) -> RelayVSR x2 -> 1920x1080 -> FILM x2 = 32 fps (~4 min mas).
+  Los pasos se encadenan solos (hilo en segundo plano y esperar_resultado) con el estado en
+  C:\\IA_Imagenes\\videos_pendientes\\<prompt_id>.json, asi que sobreviven a un reinicio del cliente.
+  Resultado: C:\\IA_Imagenes\\AAAA-MM-DD\\HHMMSS_video_<calidad>.mp4 + .png (fotograma) + .json.
+  Antes de lanzar comprueba la memoria de la GPU (RF-7): si ComfyUI retiene memoria pide reiniciarlo.
+  Medido desde Claude Desktop (2026-11-16): borrador 8,0 min, definitivo 25,5 min (5 s).
+
+Revision del resultado (v1.3.1): cada imagen guardada y el fotograma de muestra de un video se miden (desviacion
+y rugosidad de la luminancia); si parecen gris uniforme o ruido de colores la respuesta empieza por AVISO y
+el .json lleva "aviso". No bloquea nada: el resultado se guarda igual.
 
 Arranque automatico (v1.1.0): estado, generar_imagen, editar_imagen y retocar_ultima arrancan ComfyUI si
 no responde: el mismo lanzador y la misma ventana minimizada "ComfyUI servidor" que el acceso directo,
@@ -36,6 +64,7 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -45,8 +74,9 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 from PIL import Image as PILImage
+from PIL import ImageChops, ImageStat
 
-VERSION = "1.1.0"
+VERSION = "1.3.1"
 COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
 BASE = Path(os.environ.get("IA_IMAGENES", r"C:\IA_Imagenes"))
 ENTRADA = BASE / "entrada"
@@ -59,6 +89,43 @@ LANZADOR_COMFY = Path(os.environ.get("COMFY_LANZADOR", r"C:\ComfyUI\comfyui-laun
 ARRANQUE = float(os.environ.get("COMFY_MCP_ARRANQUE", "40"))
 MARCA_ARRANQUE = BASE / ".arranque_comfyui"
 TITULO_VENTANA = "ComfyUI servidor"
+MODELO_DEF = os.environ.get("COMFY_MCP_MODELO", "qwen21").strip().lower()
+VISOR = os.environ.get("COMFY_MCP_VISOR", "1").strip() != "0"
+FLUJOS_USUARIO = Path(os.environ.get("COMFY_FLUJOS_USUARIO", r"C:\ComfyUI\ComfyUI\user\default\imga_flujos"))
+LATIDO_VISOR = FLUJOS_USUARIO.parent / "imga_visor_latido.json"
+MARCA_VISOR = BASE / ".visor_abierto"
+LIC_QWEN21 = "Qwen Research License (investigacion/evaluacion, NO comercial sin licencia de Qwen)"
+MODELOS = {
+    "generar_qwen21": ("Qwen-Image 2.1", LIC_QWEN21),
+    "editar_qwen21": ("Qwen-Image 2.1 (edicion)", LIC_QWEN21),
+    "generar_rapido": ("Z-Image Turbo", "Apache-2.0"),
+    "generar_texto": ("Qwen-Image 2512 + LoRA Lightning 4 pasos", "Apache-2.0"),
+    "editar": ("Qwen-Image-Edit 2511 + LoRA Lightning 4 pasos", "Apache-2.0"),
+    "video_borrador": ("Wan 2.2 14B i2v + LoRA lightx2v 4 pasos (832x576, 16 fps)", "Apache-2.0"),
+    "video_definitivo": ("Wan 2.2 14B i2v 1280x720 + RelayVSR x2 + FILM x2 (1920x1080, 32 fps)", "Apache-2.0"),
+}
+# nodos imprescindibles de cada flujo (para aceptar un flujo editado por el usuario)
+REQUISITOS = {
+    "generar_qwen21": ["TextGenerate", "ComfySwitchNode", "EmptyLatentImage", "KSampler", "TextEncodeQwenImage21"],
+    "editar_qwen21": ["LoadImage", "TextEncodeQwenImage21", "KSampler", "TextGenerate", "ComfySwitchNode"],
+    "generar_rapido": ["CLIPTextEncode", "EmptySD3LatentImage", "KSampler", "SaveImage"],
+    "generar_texto": ["CLIPTextEncode", "EmptySD3LatentImage", "KSampler", "SaveImage"],
+    "editar": ["LoadImage", "FluxKontextImageScale", "TextEncodeQwenImageEditPlus", "KSampler", "SaveImage"],
+    "video_wan": ["LoadImage", "WanImageToVideo", "KSamplerAdvanced", "CLIPTextEncode", "CreateVideo", "SaveVideo"],
+    "video_acabado": ["LoadVideo", "VSRDecode", "ImageScale", "FrameInterpolate", "CreateVideo", "SaveVideo"],
+}
+VIDEOS_PEND = BASE / "videos_pendientes"
+VIDEO_GB_MIN = float(os.environ.get("COMFY_MCP_VIDEO_GB", "45"))  # memoria GPU libre minima para un video
+VIDEO_FPS = 16  # Wan 2.2
+VIDEO_TAM = {"borrador": (832, 576), "definitivo": (1280, 720)}  # apaisado; en vertical se giran
+VIDEO_FINAL = (1920, 1080)
+VIDEO_MINUTOS = {"borrador": "8-9", "definitivo": "25-30"}  # medidos con 5 s (spec 005; MCP 2026-11-16: 8,0 y 25,5)
+# Revision del resultado (1.3.1): con la GPU calculando mal (2026-11-16) salio gris uniforme o ruido de colores.
+# Medido en 16 imagenes del PC (lado mayor 512 px, luminancia): buenas desviacion 38-62 y rugosidad 0,11-0,34;
+# grises desviacion 0; ruido rugosidad 0,84-1,16. Rugosidad = diferencia media entre pixeles vecinos / desviacion.
+REVISAR = os.environ.get("COMFY_MCP_REVISAR", "1").strip() != "0"
+REV_DESV_PLANA = 3.0
+REV_RUGOSIDAD = 0.6
 SIN_VENTANA = 0x08000000  # CREATE_NO_WINDOW
 
 mcp = FastMCP("comfyui")
@@ -193,6 +260,7 @@ def _asegurar_comfy(limite: float | None = None) -> str:
         return ""
     if not AUTOARRANQUE:
         _json("/system_stats")  # lanza el error con la indicacion de arrancarlo a mano
+        return ""  # si responde a la segunda (respuesta lenta), no hay nada que arrancar
     t0 = time.time()
     limite = min(ARRANQUE, limite) if limite else ARRANQUE
     env = _entorno_completo()
@@ -230,11 +298,68 @@ def _subir(ruta: Path) -> str:
 
 
 # ------------------------------------------------------------------ flujos
-def _flujo(nombre: str) -> dict:
+def _faltan(nombre: str, g: dict) -> list[str]:
+    clases = {n.get("class_type") for n in g.values() if isinstance(n, dict)}
+    faltan = [c for c in REQUISITOS.get(nombre, []) if c not in clases]
+    if nombre.startswith("video_"):
+        return faltan
+    if not any(c in clases for c in ("SaveImage", "SaveImageAdvanced")):
+        faltan.append("SaveImage")
+    return faltan
+
+
+def _flujo_y_origen(nombre: str) -> tuple[dict, str]:
+    """Flujo editado por el usuario (si existe y es valido) o el instalado. Devuelve (grafo, nota de origen)."""
+    u = FLUJOS_USUARIO / f"{nombre}.json"
+    nota = ""
+    if u.exists():
+        try:
+            g = json.loads(u.read_text(encoding="utf-8"))
+            faltan = _faltan(nombre, g)
+            if not faltan:
+                return g, f"flujo editado {u}"
+            nota = f"AVISO: tu flujo {u.name} no vale (falta {', '.join(faltan)}); uso el instalado. "
+        except Exception as e:
+            nota = f"AVISO: tu flujo {u.name} no se puede leer ({e}); uso el instalado. "
     f = FLUJOS / f"{nombre}.json"
     if not f.exists():
         raise RuntimeError(f"Falta el flujo {f}. Reinstala el MCP (03_instalar_mcp_comfyui.bat).")
-    return json.loads(f.read_text(encoding="utf-8"))
+    return json.loads(f.read_text(encoding="utf-8")), nota + f"flujo instalado {f.name}"
+
+
+def _flujo(nombre: str) -> dict:
+    return _flujo_y_origen(nombre)[0]
+
+
+def _poner_prompt_qwen21(g: dict, texto: str):
+    """En los flujos de Qwen 2.1 el texto entra por un interruptor (directo / mejorador de prompt)."""
+    tg = _nodo(g, "TextGenerate")
+    g[tg]["inputs"]["prompt"] = texto
+    sw = [i for i, n in g.items() if n.get("class_type") == "ComfySwitchNode"
+          and n["inputs"].get("on_true") == [tg, 0]]
+    if not sw:
+        raise RuntimeError("El flujo de Qwen 2.1 no tiene el interruptor del prompt (on_true <- TextGenerate).")
+    g[sw[0]]["inputs"]["on_false"] = texto
+
+
+def _poner_guardado(g: dict, tipo: str):
+    for n in g.values():
+        if n.get("class_type") in ("SaveImage", "SaveImageAdvanced"):
+            n["inputs"]["filename_prefix"] = f"IMGA/{tipo}"
+
+
+def _modo_flujos(modo: str, accion: str) -> str:
+    """Traduce modo (calidad/rapido/texto) + accion (generar/editar) al nombre del flujo."""
+    modo = (modo or "calidad").strip().lower()
+    if modo in ("rapido", "rápido"):
+        return "generar_rapido" if accion == "generar" else "editar"
+    if modo == "texto" and accion == "generar":
+        return "generar_texto"
+    if modo not in ("calidad", "texto"):
+        raise RuntimeError(f"modo '{modo}' no valido: usa 'calidad' (por defecto), 'rapido' o 'texto'.")
+    if MODELO_DEF == "clasico":
+        return "generar_texto" if accion == "generar" else "editar"
+    return "generar_qwen21" if accion == "generar" else "editar_qwen21"
 
 
 def _nodo(g: dict, clase: str, titulo: str | None = None) -> str:
@@ -258,6 +383,27 @@ def _resolver_imagen(ref: str) -> Path:
 
 
 # ------------------------------------------------------------------ ejecucion y resultados
+def _abrir_visor():
+    """Abre la interfaz de ComfyUI (ventana de Edge) si no hay ninguna abierta con el complemento IMGA,
+    para que Andres vea el trabajo. El complemento escribe un latido cada 15 s; sin latido reciente se abre
+    una ventana (como mucho una cada 10 min, por si el complemento no esta instalado)."""
+    if not VISOR or os.name != "nt":
+        return
+    try:
+        if LATIDO_VISOR.exists() and time.time() - LATIDO_VISOR.stat().st_mtime < 45:
+            return
+        if MARCA_VISOR.exists() and time.time() - MARCA_VISOR.stat().st_mtime < 600:
+            return
+        MARCA_VISOR.write_text(dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+        env = _entorno_completo()
+        cmd = env.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+        subprocess.Popen([cmd, "/d", "/c", "start", "", "msedge.exe", f"--app={COMFY}/"], env=env,
+                         creationflags=SIN_VENTANA | 0x00000200, close_fds=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # el visor es una ayuda: nunca debe romper el trabajo
+
+
 def _lanzar(g: dict, tipo: str, meta: dict) -> str:
     r = _json("/prompt", {"prompt": g, "client_id": CLIENTE})
     pid = r["prompt_id"]
@@ -265,6 +411,7 @@ def _lanzar(g: dict, tipo: str, meta: dict) -> str:
     pend.mkdir(parents=True, exist_ok=True)
     (pend / f"{pid}.json").write_text(json.dumps({"tipo": tipo, "lanzado": dt.datetime.now().isoformat(timespec="seconds"),
                                                    **meta}, ensure_ascii=False, indent=1), encoding="utf-8")
+    _abrir_visor()
     return pid
 
 
@@ -278,6 +425,38 @@ def _miniatura(ruta: Path, max_lado: int = 1024) -> Image:
     buf = io.BytesIO()
     im.convert("RGB").save(buf, format="JPEG", quality=88)
     return Image(data=buf.getvalue(), format="jpeg")
+
+
+def _medir(ruta: Path) -> tuple[float, float]:
+    """(desviacion de la luminancia, rugosidad) de una imagen reducida a 512 px de lado mayor."""
+    im = PILImage.open(ruta).convert("L")
+    im.thumbnail((512, 512), PILImage.LANCZOS)
+    desv = ImageStat.Stat(im).stddev[0]
+    w, h = im.size
+    if w < 2 or h < 2 or desv < 1e-6:
+        return desv, 0.0
+    dh = ImageStat.Stat(ImageChops.difference(im.crop((0, 0, w - 1, h)), im.crop((1, 0, w, h)))).mean[0]
+    dv = ImageStat.Stat(ImageChops.difference(im.crop((0, 0, w, h - 1)), im.crop((0, 1, w, h)))).mean[0]
+    return desv, (dh + dv) / 2 / desv
+
+
+def _revisar(ruta: Path) -> str:
+    """Aviso si el resultado parece gris/plano o ruido (GPU calculando mal); '' si parece una imagen normal."""
+    if not REVISAR:
+        return ""
+    try:
+        desv, rug = _medir(ruta)
+    except Exception as e:  # una imagen que no se puede leer no debe tumbar la respuesta
+        return f"AVISO: no he podido revisar {ruta.name} ({e}). "
+    if desv < REV_DESV_PLANA:
+        como = "un color plano (gris o uniforme)"
+    elif rug > REV_RUGOSIDAD:
+        como = "ruido de colores"
+    else:
+        return ""
+    return (f"AVISO: el resultado parece {como} (desviacion {desv:.1f}, rugosidad {rug:.2f}), no una imagen. "
+            "Suele indicar que la GPU esta calculando mal: reiniciar el PC y probar con generar_imagen modo='rapido' "
+            "(unos 20 s). Si la imagen es asi a proposito, ignorar este aviso. ")
 
 
 def _recoger(pid: str):
@@ -306,21 +485,26 @@ def _recoger(pid: str):
                 continue
             q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im.get("subfolder", ""), "type": "output"})
             datos = _http(f"/view?{q}", timeout=120)
-            destino = dia / f"{dt.datetime.now():%H%M%S}_{meta.get('tipo', 'img')}_{len(rutas) + 1}.png"
+            tipo = re.sub(r"[^\w-]", "", str(meta.get("tipo") or "")) or "img"  # sin '?' ni otros caracteres no validos en Windows
+            destino = dia / f"{dt.datetime.now():%H%M%S}_{tipo}_{len(rutas) + 1}.png"
             destino.write_bytes(datos)
             rutas.append(destino)
             imagenes.append(_miniatura(destino))
+    aviso = "".join(_revisar(r) for r in rutas)
     meta.update({"prompt_id": pid, "segundos": segundos, "resultados": [str(r) for r in rutas],
                  "comfyui": [f"{im.get('subfolder', '')}/{im['filename']}" for o in h.get("outputs", {}).values()
                              for im in o.get("images", [])]})
+    if aviso:
+        meta["aviso"] = aviso.strip()
     for r in rutas:
         r.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
     if rutas:
         ESTADO.write_text(json.dumps({"ruta": str(rutas[0]), **meta}, ensure_ascii=False, indent=1), encoding="utf-8")
     if pend.exists():
         pend.unlink()
-    texto = (f"Hecho en {segundos} s. Guardado en: " + ", ".join(str(r) for r in rutas) +
-             f". Semilla {meta.get('semilla')}. (Tambien en el historial de ComfyUI.)")
+    texto = aviso + (f"Hecho en {segundos} s. Guardado en: " + ", ".join(str(r) for r in rutas) +
+             f". Semilla {meta.get('semilla')}. Modelo: {meta.get('modelo', '?')} - licencia: {meta.get('licencia', '?')}."
+             " (Tambien en el historial de ComfyUI.)")
     return (texto, imagenes), "hecho"
 
 
@@ -363,64 +547,93 @@ def estado() -> str:
         "cola": {"ejecutando": len(q.get("queue_running", [])), "pendientes": len(q.get("queue_pending", []))},
         "flujos": flujos, "carpeta_resultados": str(BASE), "carpeta_referencias": str(ENTRADA),
         "ultima_imagen": json.loads(ESTADO.read_text(encoding="utf-8")).get("ruta") if ESTADO.exists() else None,
-        "mcp": VERSION, "autoarranque": AUTOARRANQUE,
+        "mcp": VERSION, "autoarranque": AUTOARRANQUE, "modelo_por_defecto": MODELO_DEF, "visor": VISOR,
+        "flujos_editados": sorted(p.stem for p in FLUJOS_USUARIO.glob("*.json")) if FLUJOS_USUARIO.exists() else [],
         **({"arranque": nota.strip()} if nota else {}),
     }, ensure_ascii=False, indent=1)
 
 
 @mcp.tool()
-def generar_imagen(prompt: str, modo: str = "rapido", ancho: int | None = None, alto: int | None = None,
+def generar_imagen(prompt: str, modo: str = "calidad", ancho: int | None = None, alto: int | None = None,
                    semilla: int | None = None):
     """Genera una imagen desde texto con el ComfyUI local y la devuelve.
-    modo="rapido": Z-Image Turbo (por defecto 1024x1024): ~20 s con el modelo cargado, ~50 s si hay que cargarlo.
-    modo="texto": Qwen-Image 2512 con LoRA de 4 pasos (por defecto 1328x1328): ~35 s cargado, ~2,5 min si hay
-    que cargarlo; mejor para carteles y rotulos legibles (los acentos pueden salir mal: revisar).
-    Cambiar de modo/herramienta obliga a ComfyUI a cargar otro modelo: agrupar los trabajos del mismo tipo.
-    ancho/alto en pixeles (multiplos de 16 recomendados). semilla fija para repetir un resultado.
-    El prompt puede ir en espanol o en ingles; describir escena, estilo, luz y encuadre.
+    modo="calidad" (POR DEFECTO): Qwen-Image 2.1, el mas realista y fiel al texto (~65 s con el modelo cargado,
+      ~2-3 min si hay que cargarlo; devuelve un prompt_id para esperar_resultado si tarda). Licencia de
+      investigacion: NO comercial sin licencia de Qwen (se avisa en la respuesta).
+    modo="rapido": Z-Image Turbo (~20 s). Usar SOLO si el usuario pide expresamente algo rapido.
+    modo="texto": Qwen-Image 2512 + LoRA 4 pasos, para carteles y rotulos legibles.
+    Tamano por defecto 1024x1024 (ancho/alto en pixeles, multiplos de 32 recomendados). semilla fija para repetir.
+    El prompt puede ir en espanol o en ingles; describir escena, estilo, luz, encuadre y tipo de camara.
     Si ComfyUI no esta arrancado, lo arranca solo."""
     t0 = time.time()
     nota = _asegurar_comfy(ESPERA - 10)
+    nombre = _modo_flujos(modo, "generar")
+    g, origen = _flujo_y_origen(nombre)
     s = _semilla(semilla)
-    if modo == "texto":
-        g = _flujo("generar_texto")
-        g[_nodo(g, "CLIPTextEncode", "positive")]["inputs"]["text"] = prompt
-        lat = _nodo(g, "EmptySD3LatentImage")
-        tipo = "texto"
+    if nombre == "generar_qwen21":
+        _poner_prompt_qwen21(g, prompt)
+        lat = _nodo(g, "EmptyLatentImage")
+        g[lat]["inputs"]["width"] = int(ancho or 1024)
+        g[lat]["inputs"]["height"] = int(alto or 1024)
+        tipo = "calidad"
     else:
-        g = _flujo("generar_rapido")
-        g[_nodo(g, "CLIPTextEncode")]["inputs"]["text"] = prompt
+        if nombre == "generar_texto":
+            g[_nodo(g, "CLIPTextEncode", "positive")]["inputs"]["text"] = prompt
+            tipo = "texto"
+        else:
+            g[_nodo(g, "CLIPTextEncode")]["inputs"]["text"] = prompt
+            tipo = "rapido"
         lat = _nodo(g, "EmptySD3LatentImage")
-        tipo = "rapido"
-    if ancho:
-        g[lat]["inputs"]["width"] = int(ancho)
-    if alto:
-        g[lat]["inputs"]["height"] = int(alto)
+        if ancho:
+            g[lat]["inputs"]["width"] = int(ancho)
+        if alto:
+            g[lat]["inputs"]["height"] = int(alto)
     g[_nodo(g, "KSampler")]["inputs"]["seed"] = s
-    g[_nodo(g, "SaveImage")]["inputs"]["filename_prefix"] = f"IMGA/{tipo}"
-    pid = _lanzar(g, tipo, {"flujo": "generar_" + tipo, "prompt": prompt, "semilla": s,
+    _poner_guardado(g, tipo)
+    modelo, licencia = MODELOS[nombre]
+    pid = _lanzar(g, tipo, {"flujo": nombre, "origen_flujo": origen, "modelo": modelo, "licencia": licencia,
+                            "prompt": prompt, "semilla": s,
                             "ancho": g[lat]["inputs"]["width"], "alto": g[lat]["inputs"]["height"]})
     return _con_nota(nota, _esperar(pid, max(5.0, ESPERA - (time.time() - t0))))
 
 
-def _editar(instruccion: str, refs: list[Path], semilla: int | None, tipo: str):
-    if not 1 <= len(refs) <= 3:
-        raise RuntimeError("editar_imagen admite de 1 a 3 imagenes de referencia.")
-    t0 = time.time()
-    nota = _asegurar_comfy(ESPERA - 10)
-    g = _flujo("editar")
-    s = _semilla(semilla)
+def _editar_qwen21(g: dict, subidas: list[str]):
+    """Imagen 1 = el LoadImage conectado a images.image_1 del codificador; el resto se rehace (hasta 10)."""
+    enc = _nodo(g, "TextEncodeQwenImage21")
+    ent = g[enc]["inputs"]
+    n1 = ent.get("images.image_1", [None])[0]
+    if not n1 or g.get(n1, {}).get("class_type") != "LoadImage":
+        raise RuntimeError("El flujo de edicion de Qwen 2.1 no tiene un LoadImage en images.image_1.")
+    g[n1]["inputs"]["image"] = subidas[0]
+    for c in [i for i, n in g.items() if n.get("class_type") == "LoadImage" and i != n1]:
+        del g[c]
+    lotes = [i for i, n in g.items() if n.get("class_type") == "BatchImagesNode"]
+    for k in [k for k in ent if k.startswith("images.image_") and k != "images.image_1"]:
+        del ent[k]
+    for lb in lotes:
+        for k in [k for k in g[lb]["inputs"] if k.startswith("images.image") and k != "images.image0"]:
+            del g[lb]["inputs"][k]
+    for i, nombre in enumerate(subidas[1:], start=2):
+        nid = f"imga_ref{i}"
+        g[nid] = {"inputs": {"image": nombre}, "class_type": "LoadImage", "_meta": {"title": f"Referencia {i}"}}
+        ent[f"images.image_{i}"] = [nid, 0]
+        for lb in lotes:
+            g[lb]["inputs"][f"images.image{i - 1}"] = [nid, 0]
+    # nodos que apuntaban a cargas borradas (p. ej. comparadores de la plantilla): fuera
+    for i in [i for i, n in g.items() if any(isinstance(v, list) and len(v) == 2 and isinstance(v[1], int)
+                                             and str(v[0]) not in g for v in n.get("inputs", {}).values())]:
+        del g[i]
+
+
+def _editar_2511(g: dict, subidas: list[str]):
     cargas = [nid for nid, n in g.items() if n.get("class_type") == "LoadImage"]
     cod = [nid for nid, n in g.items() if n.get("class_type") == "TextEncodeQwenImageEditPlus"]
-    pos = _nodo(g, "TextEncodeQwenImageEditPlus", "positive")
-    # imagen 1: el nodo LoadImage que alimenta la escala (FluxKontextImageScale) del flujo
     esc = _nodo(g, "FluxKontextImageScale")
     n1 = g[esc]["inputs"]["image"][0]
-    otros = [c for c in cargas if c != n1]
-    subidas = [_subir(r) for r in refs]
     g[n1]["inputs"]["image"] = subidas[0]
-    for c in otros:  # se rehacen las entradas 2 y 3
-        del g[c]
+    for c in cargas:
+        if c != n1:
+            del g[c]
     for k in cod:
         for e in ("image2", "image3"):
             g[k]["inputs"].pop(e, None)
@@ -429,39 +642,62 @@ def _editar(instruccion: str, refs: list[Path], semilla: int | None, tipo: str):
         g[nid] = {"inputs": {"image": nombre}, "class_type": "LoadImage", "_meta": {"title": f"Referencia {i}"}}
         for k in cod:
             g[k]["inputs"][f"image{i}"] = [nid, 0]
-    g[pos]["inputs"]["prompt"] = instruccion
+
+
+def _editar(instruccion: str, refs: list[Path], semilla: int | None, tipo: str, modo: str = "calidad"):
+    nombre = _modo_flujos(modo, "editar")
+    maximo = 10 if nombre == "editar_qwen21" else 3
+    if not 1 <= len(refs) <= maximo:
+        raise RuntimeError(f"Con este modo se admiten de 1 a {maximo} imagenes de referencia.")
+    t0 = time.time()
+    nota = _asegurar_comfy(ESPERA - 10)
+    g, origen = _flujo_y_origen(nombre)
+    s = _semilla(semilla)
+    subidas = [_subir(r) for r in refs]
+    if nombre == "editar_qwen21":
+        _editar_qwen21(g, subidas)
+        _poner_prompt_qwen21(g, instruccion)
+    else:
+        _editar_2511(g, subidas)
+        g[_nodo(g, "TextEncodeQwenImageEditPlus", "positive")]["inputs"]["prompt"] = instruccion
     g[_nodo(g, "KSampler")]["inputs"]["seed"] = s
-    g[_nodo(g, "SaveImage")]["inputs"]["filename_prefix"] = f"IMGA/{tipo}"
-    pid = _lanzar(g, tipo, {"flujo": "editar", "instruccion": instruccion, "semilla": s,
-                            "referencias": [str(r) for r in refs]})
+    _poner_guardado(g, tipo)
+    modelo, licencia = MODELOS[nombre]
+    pid = _lanzar(g, tipo, {"flujo": nombre, "origen_flujo": origen, "modelo": modelo, "licencia": licencia,
+                            "instruccion": instruccion, "semilla": s, "referencias": [str(r) for r in refs]})
     return _con_nota(nota, _esperar(pid, max(5.0, ESPERA - (time.time() - t0))))
 
 
 @mcp.tool()
-def editar_imagen(instruccion: str, imagenes: list[str], semilla: int | None = None):
-    """Edita o crea una imagen a partir de 1 a 3 imagenes de referencia (Qwen-Image-Edit 2511, 4 pasos).
+def editar_imagen(instruccion: str, imagenes: list[str], semilla: int | None = None, modo: str = "calidad"):
+    """Edita o crea una imagen a partir de imagenes de referencia.
+    modo="calidad" (POR DEFECTO): Qwen-Image 2.1, de 1 a 10 imagenes, el mas fiel (~90 s cargado, ~3 min la 1.a vez;
+      si tarda devuelve un prompt_id para esperar_resultado). Licencia NO comercial sin licencia de Qwen.
+    modo="rapido": Qwen-Image-Edit 2511 con 4 pasos, de 1 a 3 imagenes (~40 s). Solo si el usuario pide rapidez.
     imagenes: rutas completas, o nombres de ficheros que esten en C:\\IA_Imagenes\\entrada.
-    En la instruccion, referirse a ellas como 'imagen 1', 'imagen 2'... (p. ej. 'pon el camion de la imagen 2
-    en la escena de la imagen 1'). La imagen 1 marca el encuadre y el tamano del resultado.
-    Tiempo: ~40 s con el modelo cargado; ~90 s la primera vez o despues de usar otro modo.
+    En la instruccion, referirse a ellas como 'imagen 1', 'imagen 2'... La imagen 1 marca el encuadre y el tamano.
     Las imagenes adjuntadas en el chat NO llegan aqui: tienen que estar en disco."""
-    return _editar(instruccion, [_resolver_imagen(i) for i in imagenes], semilla, "editar")
+    return _editar(instruccion, [_resolver_imagen(i) for i in imagenes], semilla, "editar", modo)
 
 
 @mcp.tool()
-def retocar_ultima(instruccion: str, imagenes_extra: list[str] | None = None, semilla: int | None = None):
+def retocar_ultima(instruccion: str, imagenes_extra: list[str] | None = None, semilla: int | None = None,
+                   modo: str = "calidad"):
     """Aplica un cambio a la ULTIMA imagen generada o editada (encadena retoques sin repetir rutas).
-    imagenes_extra: hasta 2 referencias adicionales (serian 'imagen 2' e 'imagen 3' en la instruccion)."""
+    modo="calidad" (por defecto, Qwen-Image 2.1, hasta 9 referencias extra) o "rapido" (2511, hasta 2 extra)."""
     if not ESTADO.exists():
         raise RuntimeError("Todavia no hay ninguna imagen anterior: usa generar_imagen o editar_imagen.")
     ultima = Path(json.loads(ESTADO.read_text(encoding="utf-8"))["ruta"])
     refs = [ultima] + [_resolver_imagen(i) for i in (imagenes_extra or [])]
-    return _editar(instruccion, refs, semilla, "retoque")
+    return _editar(instruccion, refs, semilla, "retoque", modo)
 
 
 @mcp.tool()
 def esperar_resultado(prompt_id: str, segundos: float = 50):
-    """Espera (hasta 'segundos') a un trabajo lanzado antes y devuelve la imagen cuando termine."""
+    """Espera (hasta 'segundos') a un trabajo lanzado antes y devuelve la imagen (o el video) cuando termine.
+    Con un video, cada llamada informa del paso en que va; llamar de nuevo hasta que diga 'Hecho'."""
+    if (VIDEOS_PEND / f"{prompt_id}.json").exists() or (VIDEOS_PEND / f"{prompt_id}.hecho.json").exists():
+        return _esperar_video(prompt_id, segundos)
     return _esperar(prompt_id, segundos)
 
 
@@ -480,6 +716,7 @@ def listar_resultados(cuantos: int = 10) -> str:
     for f in fichas:
         m = json.loads(f.read_text(encoding="utf-8"))
         filas.append({"imagen": str(f.with_suffix(".png")), "flujo": m.get("flujo"),
+                      **({"video": str(f.with_suffix(".mp4"))} if f.with_suffix(".mp4").exists() else {}),
                       "texto": m.get("prompt") or m.get("instruccion"), "semilla": m.get("semilla"),
                       "segundos": m.get("segundos"), "referencias": m.get("referencias")})
     return json.dumps(filas, ensure_ascii=False, indent=1)
@@ -498,9 +735,332 @@ def liberar_memoria() -> str:
             f"memoria GPU libre {round(s['devices'][0]['vram_free'] / 1e9, 1)} GB.")
 
 
+# ------------------------------------------------------------------ video (v1.3.0, spec 005)
+def _memoria_gpu_gb() -> float:
+    s = _json("/system_stats")
+    return round((s.get("devices") or [{}])[0].get("vram_free", 0) / 1e9, 1)
+
+
+def _comprobar_memoria_video():
+    """RF-7: un video necesita mucha memoria. Si falta, libera la de ComfyUI; si sigue faltando, lo explica."""
+    libre = _memoria_gpu_gb()
+    if libre >= VIDEO_GB_MIN:
+        return ""
+    _json("/free", {"unload_models": True, "free_memory": True})
+    time.sleep(3)
+    libre2 = _memoria_gpu_gb()
+    if libre2 >= VIDEO_GB_MIN:
+        return f"(He liberado memoria de ComfyUI: {libre} -> {libre2} GB libres.) "
+    raise RuntimeError(
+        f"Solo hay {libre2} GB libres de memoria de la GPU y un video necesita al menos {VIDEO_GB_MIN:.0f} GB. "
+        "Si ComfyUI acaba de hacer un trabajo cortado, retiene memoria aunque se le pida liberarla: hay que cerrar la "
+        "ventana 'ComfyUI servidor' de la barra de tareas (el MCP lo vuelve a arrancar solo). Si no, cerrar o "
+        "descargar el modelo grande de otra app (LM Studio) y volver a intentarlo.")
+
+
+def _orientacion(ruta: Path, calidad: str) -> tuple[int, int, str]:
+    """Tamano de Wan segun la forma de la imagen (apaisada o vertical) y aviso si se va a deformar."""
+    w, h = PILImage.open(ruta).size
+    a, b = VIDEO_TAM[calidad]
+    ancho, alto = (a, b) if w >= h else (b, a)
+    aviso = ""
+    if abs((w / h) / (ancho / alto) - 1) > 0.05:
+        aviso = (f"AVISO: la imagen es {w}x{h} y el video sale {ancho}x{alto}: se estira. Para que no se deforme, "
+                 f"usa una imagen en {'16:9' if calidad == 'definitivo' else 'proporcion 13:9'}. ")
+    return ancho, alto, aviso
+
+
+def _preparar_wan(g: dict, subida: str, prompt: str, ancho: int, alto: int, segundos: float, semilla: int,
+                  fotograma: bool) -> dict:
+    """Rellena el flujo de Wan: imagen, texto, tamano, duracion (fotogramas = 16*s+1), semilla, LoRA 4 pasos."""
+    carga = _nodo(g, "LoadImage")
+    g[carga]["inputs"]["image"] = subida
+    wan = _nodo(g, "WanImageToVideo")
+    g[wan]["inputs"]["width"], g[wan]["inputs"]["height"] = int(ancho), int(alto)
+    pos = g[wan]["inputs"]["positive"][0]
+    if g.get(pos, {}).get("class_type") != "CLIPTextEncode":
+        raise RuntimeError("El flujo de Wan no tiene el texto positivo conectado a WanImageToVideo.")
+    g[pos]["inputs"]["text"] = prompt
+    largo = g[wan]["inputs"].get("length")
+    if isinstance(largo, list):  # plantilla oficial: duracion (s) x fps + 1 con nodos Primitive
+        for n in g.values():
+            if n.get("class_type") == "PrimitiveFloat" and "duration" in n.get("_meta", {}).get("title", "").lower():
+                n["inputs"]["value"] = float(segundos)
+            if n.get("class_type") == "PrimitiveFloat" and "fps" in n.get("_meta", {}).get("title", "").lower():
+                n["inputs"]["value"] = float(VIDEO_FPS)
+    else:
+        g[wan]["inputs"]["length"] = int(segundos * VIDEO_FPS) + 1
+    for n in g.values():
+        if n.get("class_type") == "KSamplerAdvanced" and n["inputs"].get("add_noise") == "enable":
+            n["inputs"]["noise_seed"] = int(semilla)
+        if n.get("class_type") == "PrimitiveBoolean" and "lora" in n.get("_meta", {}).get("title", "").lower():
+            n["inputs"]["value"] = True
+    for n in g.values():
+        if n.get("class_type") == "SaveVideo":
+            n["inputs"]["filename_prefix"] = "video/IMGA_video"
+    _ajustar_fotograma(g, fotograma, int(segundos * VIDEO_FPS) // 2)
+    return g
+
+
+def _ajustar_fotograma(g: dict, quiere: bool, indice: int):
+    """El fotograma de muestra: ImageFromBatch -> SaveImage. Se quita si no se quiere (paso intermedio)."""
+    sacar = [i for i, n in g.items() if n.get("class_type") == "ImageFromBatch"]
+    for i in sacar:
+        if quiere:
+            g[i]["inputs"]["batch_index"] = max(0, int(indice))
+    if not quiere:
+        destino = {i for i, n in g.items() if n.get("class_type") in ("SaveImage", "SaveImageAdvanced")
+                   and any(isinstance(v, list) and v[0] in sacar for v in n["inputs"].values())}
+        for i in set(sacar) | destino:
+            g.pop(i, None)
+    for n in g.values():
+        if n.get("class_type") in ("SaveImage", "SaveImageAdvanced"):
+            n["inputs"]["filename_prefix"] = "IMGA/video_fotograma"
+
+
+def _preparar_acabado(g: dict, video_entrada: str, segundos: float, vertical: bool) -> dict:
+    g[_nodo(g, "LoadVideo")]["inputs"]["file"] = video_entrada
+    esc = _nodo(g, "ImageScale")
+    g[esc]["inputs"]["width"], g[esc]["inputs"]["height"] = (VIDEO_FINAL[1], VIDEO_FINAL[0]) if vertical else VIDEO_FINAL
+    fi = _nodo(g, "FrameInterpolate")
+    mult = int(g[fi]["inputs"].get("multiplier", 2)) if not isinstance(g[fi]["inputs"].get("multiplier"), list) else 2
+    for n in g.values():
+        if n.get("class_type") == "CreateVideo" and not isinstance(n["inputs"].get("fps"), list):
+            n["inputs"]["fps"] = float(VIDEO_FPS * mult)
+        if n.get("class_type") == "SaveVideo":
+            n["inputs"]["filename_prefix"] = "video/IMGA_video"
+    _ajustar_fotograma(g, True, int(segundos * VIDEO_FPS * mult) // 2)
+    return g
+
+
+def _ruta_trabajo(jid: str, hecho: bool = False) -> Path:
+    return VIDEOS_PEND / (f"{jid}.hecho.json" if hecho else f"{jid}.json")
+
+
+def _guardar_trabajo(t: dict):
+    VIDEOS_PEND.mkdir(parents=True, exist_ok=True)
+    tmp = _ruta_trabajo(t["id"]).with_suffix(".tmp")
+    tmp.write_text(json.dumps(t, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, _ruta_trabajo(t["id"]))
+
+
+def _enviar(g: dict) -> str:
+    pid = _json("/prompt", {"prompt": g, "client_id": CLIENTE})["prompt_id"]
+    _abrir_visor()
+    return pid
+
+
+def _salidas(h: dict) -> tuple[list[dict], list[dict]]:
+    """(videos, imagenes) de salida de un trabajo terminado."""
+    videos, imagenes = [], []
+    for out in h.get("outputs", {}).values():
+        for f in out.get("images", []) + out.get("videos", []) + out.get("gifs", []):
+            if f.get("type") != "output":
+                continue
+            (videos if str(f.get("filename", "")).lower().endswith((".mp4", ".webm", ".mov")) else imagenes).append(f)
+    return videos, imagenes
+
+
+def _bajar(f: dict) -> bytes:
+    q = urllib.parse.urlencode({"filename": f["filename"], "subfolder": f.get("subfolder", ""), "type": "output"})
+    return _http(f"/view?{q}", timeout=600)
+
+
+def _subir_bytes(datos: bytes, nombre: str) -> str:
+    tmp = BASE / "videos_pendientes" / nombre
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_bytes(datos)
+    try:
+        return _subir(tmp)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _segundos_trabajo(h: dict) -> float | None:
+    msgs = {k: v for k, v in h.get("status", {}).get("messages", [])}
+    t0 = msgs.get("execution_start", {}).get("timestamp")
+    t1 = msgs.get("execution_success", {}).get("timestamp")
+    return round((t1 - t0) / 1000, 1) if t0 and t1 else None
+
+
+def _bloqueo(jid: str):
+    """Evita que dos clientes (p. ej. Claude y Hermes) avancen a la vez el mismo video."""
+    VIDEOS_PEND.mkdir(parents=True, exist_ok=True)
+    cerrojo = VIDEOS_PEND / f"{jid}.lock"
+    try:
+        if cerrojo.exists() and time.time() - cerrojo.stat().st_mtime > 300:
+            cerrojo.unlink(missing_ok=True)
+        fd = os.open(cerrojo, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return cerrojo
+    except FileExistsError:
+        return None
+
+
+def _avanzar_video(jid: str) -> tuple[str, list]:
+    """Mira el paso actual del video y, si ha terminado, lanza el siguiente o recoge el resultado.
+    Devuelve (estado, contenido): estado = 'en_curso' | 'hecho' | 'error'."""
+    hecho = _ruta_trabajo(jid, True)
+    if hecho.exists():
+        t = json.loads(hecho.read_text(encoding="utf-8"))
+        return "hecho", _texto_video(t)
+    ruta = _ruta_trabajo(jid)
+    if not ruta.exists():
+        return "error", [f"No conozco el video {jid}."]
+    cerrojo = _bloqueo(jid)
+    if cerrojo is None:
+        t = json.loads(ruta.read_text(encoding="utf-8"))
+        return "en_curso", [_texto_en_curso(t, "otro cliente lo esta actualizando")]
+    try:
+        t = json.loads(ruta.read_text(encoding="utf-8"))
+        h = _historial(t["actual"])
+        if not h:
+            q = _json("/queue")
+            corriendo = any(x[1] == t["actual"] for x in q.get("queue_running", []))
+            en_cola = any(x[1] == t["actual"] for x in q.get("queue_pending", []))
+            if not corriendo and not en_cola:
+                t["error"] = ("ComfyUI ya no tiene este trabajo (se reinicio o se cancelo). Vuelve a lanzar el video "
+                              "con generar_video.")
+                _guardar_trabajo(t)
+                return "error", [t["error"]]
+            return "en_curso", [_texto_en_curso(t, "ejecutandose" if corriendo else "en cola")]
+        msgs = {k: v for k, v in h.get("status", {}).get("messages", [])}
+        if "execution_error" in msgs or "execution_interrupted" in msgs:
+            e = msgs.get("execution_error") or {}
+            t["error"] = (f"ERROR en ComfyUI en el paso {t['paso']} (nodo {e.get('node_type')}): "
+                          f"{str(e.get('exception_message', 'cancelado'))[:600]}")
+            _guardar_trabajo(t)
+            return "error", [t["error"]]
+        t.setdefault("tiempos", {})[str(t["paso"])] = _segundos_trabajo(h)
+        videos, imagenes = _salidas(h)
+        if not videos:
+            t["error"] = f"El paso {t['paso']} termino sin video de salida."
+            _guardar_trabajo(t)
+            return "error", [t["error"]]
+        if t["paso"] < t["pasos"]:  # definitivo: paso 1 (Wan 720p) -> paso 2 (acabado)
+            subida = _subir_bytes(_bajar(videos[0]), f"{jid[:8]}_wan720p.mp4")
+            g, origen = _flujo_y_origen("video_acabado")
+            _preparar_acabado(g, subida, t["segundos_video"], t["vertical"])
+            t["origen_flujo"] += f"; {origen}"
+            t["actual"] = _enviar(g)
+            t["paso"] += 1
+            t["paso_iniciado"] = dt.datetime.now().isoformat(timespec="seconds")
+            _guardar_trabajo(t)
+            return "en_curso", [_texto_en_curso(t, "en cola")]
+        dia = BASE / dt.date.today().isoformat()
+        dia.mkdir(parents=True, exist_ok=True)
+        base = dia / f"{dt.datetime.now():%H%M%S}_video_{t['calidad']}"
+        base.with_suffix(".mp4").write_bytes(_bajar(videos[0]))
+        if imagenes:
+            base.with_suffix(".png").write_bytes(_bajar(imagenes[0]))
+        aviso = _revisar(base.with_suffix(".png")) if imagenes else ""
+        t.update({"resultado": str(base.with_suffix(".mp4")),
+                  "fotograma": str(base.with_suffix(".png")) if imagenes else None,
+                  "aviso": aviso.strip() or None,
+                  "segundos": round(sum(v for v in t["tiempos"].values() if v), 1),
+                  "terminado": dt.datetime.now().isoformat(timespec="seconds")})
+        base.with_suffix(".json").write_text(json.dumps(t, ensure_ascii=False, indent=1), encoding="utf-8")
+        hecho.write_text(json.dumps(t, ensure_ascii=False, indent=1), encoding="utf-8")
+        ruta.unlink(missing_ok=True)
+        return "hecho", _texto_video(t)
+    finally:
+        cerrojo.unlink(missing_ok=True)
+
+
+def _texto_en_curso(t: dict, estado: str) -> str:
+    desde = dt.datetime.fromisoformat(t["lanzado"])
+    minutos = round((dt.datetime.now() - desde).total_seconds() / 60, 1)
+    paso = ("Wan 2.2" if t["paso"] == 1 else "RelayVSR + 1080p + FILM") + (f" (paso {t['paso']} de {t['pasos']})"
+                                                                          if t["pasos"] > 1 else "")
+    return (f"Video {t['calidad']} en marcha: {paso}, {estado}. Llevamos {minutos} min de unos "
+            f"{VIDEO_MINUTOS[t['calidad']]} min previstos (5 s de video). Llama a esperar_resultado con "
+            f"prompt_id='{t['id']}' (cada llamada espera como mucho ~50 s). Se ve en la pestana de ComfyUI.")
+
+
+def _texto_video(t: dict) -> list:
+    if t.get("error"):
+        return [t["error"]]
+    texto = ((t["aviso"] + " ") if t.get("aviso") else "") + (f"Hecho: video {t['calidad']} {t['ancho_final']}x{t['alto_final']} a {t['fps_final']} fps, "
+             f"{t['segundos_video']} s, en {round((t.get('segundos') or 0) / 60, 1)} min. Guardado en: {t['resultado']}"
+             + (f" (fotograma de muestra: {t['fotograma']})" if t.get("fotograma") else "") +
+             f". Semilla {t['semilla']}. Modelo: {t['modelo']} - licencia: {t['licencia']}.")
+    out = [texto]
+    if t.get("fotograma") and Path(t["fotograma"]).exists():
+        out.append(_miniatura(Path(t["fotograma"])))
+    return out
+
+
+def _esperar_video(jid: str, espera: float | None = None) -> list:
+    limite = time.time() + (ESPERA if espera is None else min(float(espera), 55))
+    while True:
+        estado_v, contenido = _avanzar_video(jid)
+        if estado_v != "en_curso" or time.time() >= limite:
+            return contenido
+        time.sleep(5)
+
+
+def _hilo_videos():
+    """Avanza los videos pendientes aunque nadie llame a esperar_resultado (mientras viva el MCP)."""
+    while True:
+        time.sleep(20)
+        try:
+            for f in sorted(VIDEOS_PEND.glob("*.json")):
+                if f.name.endswith(".hecho.json"):
+                    continue
+                if _responde():
+                    _avanzar_video(f.stem)
+        except Exception:
+            pass
+
+
+@mcp.tool()
+def generar_video(prompt: str, imagen: str, calidad: str = "borrador", segundos: float = 5,
+                  semilla: int | None = None) -> str:
+    """Crea un video corto a partir de una imagen (la imagen es el primer fotograma) con Wan 2.2 en el ComfyUI local.
+    calidad="borrador" (POR DEFECTO): 832x576, 16 fps, ~8-9 min por 5 s. Para probar encuadre y movimiento.
+    calidad="definitivo": 1920x1080 a 32 fps (Wan 720p + RelayVSR x2 + FILM), ~25-30 min por 5 s. Solo si el usuario
+      lo pide (definitivo, final, 1080p, alta calidad).
+    imagen: ruta completa o nombre de un fichero de C:\\IA_Imagenes\\entrada (vale una imagen generada antes, p. ej.
+      la ruta que devolvio generar_imagen). Mejor apaisada 16:9 (si es vertical, el video sale vertical).
+    prompt: describir el MOVIMIENTO (camara y escena), p. ej. "dron avanzando despacio sobre el frente de la cantera,
+      camara estable, luz natural". En ingles suele seguirlo mejor.
+    segundos: de 2 a 8 (Wan esta entrenado para 5). Todo con licencia Apache-2.0.
+    Devuelve enseguida un prompt_id: llamar a esperar_resultado(prompt_id) hasta que diga 'Hecho'. Los pasos siguen
+    solos en segundo plano; el resultado queda en C:\\IA_Imagenes\\AAAA-MM-DD\\ (mp4 + fotograma png + json)."""
+    calidad = (calidad or "borrador").strip().lower()
+    if calidad not in VIDEO_TAM:
+        raise RuntimeError(f"calidad '{calidad}' no valida: usa 'borrador' (por defecto) o 'definitivo'.")
+    segundos = float(segundos or 5)
+    if not 2 <= segundos <= 8:
+        raise RuntimeError("segundos debe estar entre 2 y 8 (Wan 2.2 esta entrenado para 5 s).")
+    ref = _resolver_imagen(imagen)
+    nota = _asegurar_comfy(ESPERA - 10)
+    nota += _comprobar_memoria_video()
+    ancho, alto, aviso = _orientacion(ref, calidad)
+    s = _semilla(semilla)
+    g, origen = _flujo_y_origen("video_wan")
+    _preparar_wan(g, _subir(ref), prompt, ancho, alto, segundos, s, fotograma=(calidad == "borrador"))
+    pid = _enviar(g)
+    vertical = alto > ancho
+    fin = (ancho, alto) if calidad == "borrador" else ((VIDEO_FINAL[1], VIDEO_FINAL[0]) if vertical else VIDEO_FINAL)
+    modelo, licencia = MODELOS[f"video_{calidad}"]
+    t = {"id": pid, "tipo": "video", "calidad": calidad, "prompt": prompt, "imagen": str(ref), "semilla": s,
+         "segundos_video": segundos, "ancho_wan": ancho, "alto_wan": alto, "vertical": vertical,
+         "ancho_final": fin[0], "alto_final": fin[1], "fps_final": VIDEO_FPS * (2 if calidad == "definitivo" else 1),
+         "modelo": modelo, "licencia": licencia, "origen_flujo": origen,
+         "pasos": 2 if calidad == "definitivo" else 1, "paso": 1, "actual": pid,
+         "lanzado": dt.datetime.now().isoformat(timespec="seconds")}
+    _guardar_trabajo(t)
+    return (nota + aviso + f"Video {calidad} lanzado (prompt_id='{pid}'): {fin[0]}x{fin[1]}, {segundos} s, semilla {s}. "
+            f"Tardara unos {VIDEO_MINUTOS[calidad]} min (por 5 s de video). Llama a esperar_resultado con ese "
+            "prompt_id para seguirlo; el trabajo se ve en la pestana de ComfyUI. Modelo: "
+            f"{modelo} - licencia: {licencia}.")
+
+
 def main():
     for d in (BASE, ENTRADA):
         d.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=_hilo_videos, daemon=True, name="videos").start()
     mcp.run()
 
 

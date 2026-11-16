@@ -33,6 +33,9 @@ for carpeta in ("servidor", "flujos", "lanzador", "plantillas"):
     for f in sorted((RAIZ / carpeta).iterdir()):
         if f.is_file() and f.suffix in (".py", ".json", ".md", ".bat", ".yaml"):
             MAPA.append((f, NOTAS / "mcp" / "comfyui" / carpeta / f.name))
+for rel in ("__init__.py", "web/imga_mcp.js"):
+    MAPA.append((RAIZ / "complemento_comfyui" / "imga_mcp" / rel,
+                 NOTAS / "mcp" / "comfyui" / "complemento_comfyui" / "imga_mcp" / rel))
 for nombre in ("03_instalar_mcp_comfyui.bat", "instalar_mcp_comfyui.py",
                "04_configurar_mcp_comfyui.bat", "configurar_mcp_comfyui.py"):
     MAPA.append((RAIZ / "scripts" / nombre, NOTAS / "scripts" / "comfyui" / nombre))

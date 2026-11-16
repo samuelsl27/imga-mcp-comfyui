@@ -4,9 +4,10 @@ Instala (o actualiza) el MCP propio "comfyui" de IMGA en C:\\ComfyUI_MCP y lo pr
   1. Requisitos: uv, ficheros de referencia en C:\\Notas_IA\\mcp\\comfyui
   2. Entorno C:\\ComfyUI_MCP\\.venv (Python 3.13 de uv) con mcp==1.30.0 y pillow==13.0.0
      (mcp 2.x cambia la API de FastMCP: se fija la 1.x con la que esta escrito el servidor)
-  3. Copia servidor, flujos y lanzador (SHA-256 contra la referencia)
+  3. Copia servidor, flujos (5 de imagen + 2 de video desde 1.3.0) y lanzador (SHA-256 contra la referencia) y el complemento de interfaz imga_mcp
+     en C:\\ComfyUI\\ComfyUI\\custom_nodes\\imga_mcp (se carga al reiniciar ComfyUI)
   4. Carpetas C:\\IA_Imagenes y C:\\IA_Imagenes\\entrada
-  5. Prueba real por stdio a traves del lanzador: initialize -> tools/list (8) -> estado
+  5. Prueba real por stdio a traves del lanzador: initialize -> tools/list (9) -> estado
      y, si ComfyUI esta arrancado, generar_imagen (Z-Image, 768x768, semilla 42) con la imagen devuelta
 No toca la configuracion de ninguna app de IA (eso es 04_configurar_mcp_comfyui.bat).
 
@@ -47,7 +48,7 @@ UV = shutil.which("uv") or str(HOME / ".local" / "bin" / "uv.exe")
 CMD = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "cmd.exe")
 PAQUETES = ["mcp==1.30.0", "pillow==13.0.0"]
 HERRAMIENTAS = {"estado", "generar_imagen", "editar_imagen", "retocar_ultima", "esperar_resultado",
-                "ver_imagen", "listar_resultados", "liberar_memoria"}
+                "ver_imagen", "listar_resultados", "liberar_memoria", "generar_video"}
 
 LINEAS, FALLOS, AVISOS = [], [], []
 
@@ -78,6 +79,7 @@ def env_limpio():
     e = os.environ.copy()
     for k in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
         e.pop(k, None)
+    e["COMFY_MCP_VISOR"] = "0"  # la prueba no abre ventanas de la interfaz
     return e
 
 
@@ -203,8 +205,12 @@ log("")
 log("== 3. Ficheros (copia + SHA-256)")
 copiar(REF / "servidor" / "servidor_comfyui_mcp.py", DEST / "servidor_comfyui_mcp.py")
 copiar(REF / "lanzador" / "comfyui-mcp-launch.bat", LANZ)
-for f in ("generar_rapido", "generar_texto", "editar"):
+for f in ("generar_qwen21", "editar_qwen21", "generar_rapido", "generar_texto", "editar", "video_wan", "video_acabado"):
     copiar(REF / "flujos" / f"{f}.json", DEST / "flujos" / f"{f}.json")
+EXT = Path(r"C:\ComfyUI\ComfyUI\custom_nodes\imga_mcp")
+copiar(REF / "complemento_comfyui" / "imga_mcp" / "__init__.py", EXT / "__init__.py")
+copiar(REF / "complemento_comfyui" / "imga_mcp" / "web" / "imga_mcp.js", EXT / "web" / "imga_mcp.js")
+log("   (el complemento imga_mcp se carga al reiniciar ComfyUI: Gestor -> Reiniciar, o cerrar y abrir)")
 log("")
 log("== 4. Carpetas de imagenes")
 for d in (BASE, BASE / "entrada"):

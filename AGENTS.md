@@ -6,7 +6,7 @@
 ## Qué es
 
 Servidor MCP propio de IMGA, S.L.P. que deja a las apps de IA del Minisforum MS-S1 (Claude Desktop,
-LM Studio, Bionic, Hermes Agent) **generar y editar imágenes con el ComfyUI local**
+LM Studio, Bionic, Hermes Agent) **generar y editar imágenes con el ComfyUI local** (por defecto Qwen-Image 2.1, licencia no comercial: ver spec 004)
 (`http://127.0.0.1:8188`, GPU Radeon 8060S con ROCm). Si ComfyUI está parado, lo arranca.
 
 - Propietario: Andrés M. Sáez Vizcaíno — IMGA, S.L.P. Uso interno.
@@ -33,9 +33,10 @@ MCP_ConfyUI\
 ├── pyproject.toml             ← versión y dependencias fijadas (mcp==1.30.0, pillow==13.0.0)
 ├── servidor\                  ← servidor_comfyui_mcp.py (un solo fichero, stdio)
 ├── flujos\                    ← flujos ComfyUI en formato API (exportados desde la interfaz, no a mano)
+├── complemento_comfyui\       ← imga_mcp: complemento de interfaz (menú IMGA, pestaña por trabajo, guardar flujo)
 ├── lanzador\                  ← comfyui-mcp-launch.bat (lo que ejecutan las apps)
 ├── plantillas\                ← bloques de configuración por app (Claude Desktop, LM Studio, Bionic, Hermes)
-├── scripts\                   ← 00 git, 03 instalar, 04 configurar apps, publicar en C:\Notas_IA
+├── scripts\                   ← 00 git, 01 commit (mensaje en mensaje_commit.txt), 03 instalar, 04 configurar apps, publicar en C:\Notas_IA
 ├── tests\                     ← pytest sin ComfyUI (HTTP simulado)
 ├── docs\                      ← constitución, flujo SDD, arquitectura, plantillas de spec/plan/tareas
 └── specs\NNN-nombre\          ← spec.md, plan.md, tasks.md
@@ -47,7 +48,8 @@ MCP_ConfyUI\
 2. Código + pruebas en `tests/` → `uv run --no-project --python 3.13 --with mcp==1.30.0 --with pillow==13.0.0 --with pytest pytest -q`
 3. Subir versión en `pyproject.toml` **y** en `VERSION` de `servidor/servidor_comfyui_mcp.py` (deben coincidir;
    lo comprueba una prueba), y anotar en `CHANGELOG.md`.
-4. Commit en git (mensajes en español, en presente: «Añade…», «Corrige…»).
+4. Commit en git (mensajes en español, en presente: «Añade…», «Corrige…»): el agente escribe el mensaje en
+   `scripts\mensaje_commit.txt` (no se versiona) y Andrés ejecuta `scripts\01_commit_git.bat` (pasa las pruebas antes).
 5. `scripts\publicar_en_notas.bat` → copia a `C:\Notas_IA` (SHA-256) tras pasar las pruebas.
 6. Andrés ejecuta `C:\Notas_IA\scripts\comfyui\03_instalar_mcp_comfyui.bat` (y `04_…` si cambian las apps).
 7. Probar en las apps y documentar en `C:\Notas_IA` (ficha, matriz, CHANGELOG del equipo).
