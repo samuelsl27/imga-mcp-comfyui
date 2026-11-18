@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Proyecto | Propio de IMGA. **Repositorio (desarrollo, git):** `Z:\cu\SOFTWARE_APLIACIONES_IMGA\Desarrollado_IMGA\MCP_ConfyUI` → copia publicada `C:\Notas_IA\mcp\comfyui\` → instalado `C:\ComfyUI_MCP\` |
-| Licencia | Interno IMGA |
+| Licencia | Código: MIT (`LICENSE`). Los modelos que usa tienen su propia licencia: Qwen-Image 2.1 es **no comercial** (ver «Modelos y licencias») |
 | Versión | 1.3.1 (2026-11-16: aviso si el resultado sale gris o con ruido) · 1.3.0 (2026-11-16: vídeo con Wan 2.2, borrador y definitivo 1080p) · 1.2.0 (Qwen-Image 2.1 por defecto, visor en ComfyUI, flujos editables) · SDK `mcp==1.30.0` (la 2.x renombra FastMCP: no usar sin adaptar) · `pillow==13.0.0` · Python 3.13 (uv) |
 | Transporte | stdio. Habla por HTTP con ComfyUI en `http://127.0.0.1:8188`; **si no responde, lo arranca él** (ver abajo) |
 | Lanzador | `C:\ComfyUI_MCP\comfyui-mcp-launch.bat` (fuente: `lanzador\`). En apps Node: `cmd.exe /d /c C:\ComfyUI_MCP\comfyui-mcp-launch.bat` |
